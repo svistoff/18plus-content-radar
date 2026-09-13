@@ -47,9 +47,28 @@ class Video(Base):
     published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     duration_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
     view_count: Mapped[int] = mapped_column(Integer, default=0)
+    like_count: Mapped[int] = mapped_column(Integer, default=0)
+    comment_count: Mapped[int] = mapped_column(Integer, default=0)
     viral_score: Mapped[int] = mapped_column(Integer, default=0)
     editorial_score: Mapped[int] = mapped_column(Integer, default=0)
+    score_explanation: Mapped[str | None] = mapped_column(Text, nullable=True)
+    scored_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     workflow_status: Mapped[str] = mapped_column(String(30), default="discovered")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     channel: Mapped[Channel] = relationship(back_populates="videos")
     discovered_by_query: Mapped["SearchQuery | None"] = relationship()
+    metric_snapshots: Mapped[list["VideoMetricSnapshot"]] = relationship(
+        back_populates="video", cascade="all, delete-orphan"
+    )
+
+
+class VideoMetricSnapshot(Base):
+    __tablename__ = "video_metric_snapshots"
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    video_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("videos.id"))
+    captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    view_count: Mapped[int] = mapped_column(Integer, default=0)
+    like_count: Mapped[int] = mapped_column(Integer, default=0)
+    comment_count: Mapped[int] = mapped_column(Integer, default=0)
+    video: Mapped[Video] = relationship(back_populates="metric_snapshots")

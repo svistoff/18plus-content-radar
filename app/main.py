@@ -1,3 +1,4 @@
+import json
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -7,22 +8,37 @@ from fastapi import Depends, FastAPI, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from sqlalchemy.orm import Session, joinedload
 
 from app.database import Base, SessionLocal, engine, get_db
 from app.models import Channel, SearchQuery, Video
 from app.seed import seed_search_queries
 from app.services.discovery_service import run_search_for_query
+from app.services.scoring_service import recompute_all_scores
 from app.services.youtube_client import YouTubeAPIError
 
 BASE_DIR = Path(__file__).resolve().parent
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
 
+# Lightweight, idempotent column additions for existing Postgres deployments.
+# Full Alembic migrations arrive with production hardening; until then this keeps
+# an already-running database in sync with new model columns without data loss.
+_POSTGRES_COLUMN_PATCHES = (
+    "ALTER TABLE videos ADD COLUMN IF NOT EXISTS like_count INTEGER DEFAULT 0",
+    "ALTER TABLE videos ADD COLUMN IF NOT EXISTS comment_count INTEGER DEFAULT 0",
+    "ALTER TABLE videos ADD COLUMN IF NOT EXISTS score_explanation TEXT",
+    "ALTER TABLE videos ADD COLUMN IF NOT EXISTS scored_at TIMESTAMPTZ",
+)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     Base.metadata.create_all(bind=engine)
+    if engine.dialect.name == "postgresql":
+        with engine.begin() as conn:
+            for statement in _POSTGRES_COLUMN_PATCHES:
+                conn.execute(text(statement))
     with SessionLocal() as db:
         seed_search_queries(db)
     yield
@@ -103,11 +119,26 @@ def run_query(query_id: uuid.UUID, db: Session = Depends(get_db)):
     return RedirectResponse(f"/queries?ok={quote(message)}", status_code=303)
 
 
+@app.post("/scores/recompute")
+def recompute_scores(db: Session = Depends(get_db)):
+    count = recompute_all_scores(db)
+    message = f"Рейтинг пересчитан для {count} видео"
+    return RedirectResponse(f"/videos?ok={quote(message)}", status_code=303)
+
+
 @app.get("/videos", response_class=HTMLResponse)
 def videos_page(request: Request, db: Session = Depends(get_db)):
     videos = db.scalars(
         select(Video)
         .options(joinedload(Video.channel))
-        .order_by(Video.published_at.desc().nullslast())
+        .order_by(Video.viral_score.desc(), Video.published_at.desc().nullslast())
     ).all()
-    return templates.TemplateResponse(request, "videos.html", {"videos": videos})
+    items = [
+        {"video": video, "why": json.loads(video.score_explanation or "[]")}
+        for video in videos
+    ]
+    return templates.TemplateResponse(
+        request,
+        "videos.html",
+        {"items": items, "ok_message": request.query_params.get("ok")},
+    )

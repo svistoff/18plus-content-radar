@@ -7,7 +7,8 @@ from datetime import datetime
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.models import Channel, SearchQuery, Video
+from app.models import Channel, SearchQuery, Video, VideoMetricSnapshot
+from app.services.scoring_service import recompute_all_scores
 from app.services.youtube_client import YouTubeClient, parse_iso8601_duration
 
 
@@ -35,33 +36,47 @@ def run_search_for_query(db: Session, query: SearchQuery) -> dict:
 
         video = db.scalar(select(Video).where(Video.external_video_id == external_video_id))
         view_count = _safe_int(statistics.get("viewCount")) or 0
+        like_count = _safe_int(statistics.get("likeCount")) or 0
+        comment_count = _safe_int(statistics.get("commentCount")) or 0
         published_at = _parse_datetime(snippet.get("publishedAt"))
         duration_seconds = parse_iso8601_duration(content_details.get("duration"))
         thumbnail_url = _pick_thumbnail(snippet.get("thumbnails"))
 
         if video is None:
-            db.add(
-                Video(
-                    external_video_id=external_video_id,
-                    channel=channel,
-                    discovered_by_query=query,
-                    title=snippet.get("title") or "Без названия",
-                    description=snippet.get("description"),
-                    url=f"https://www.youtube.com/watch?v={external_video_id}",
-                    thumbnail_url=thumbnail_url,
-                    published_at=published_at,
-                    duration_seconds=duration_seconds,
-                    view_count=view_count,
-                )
+            video = Video(
+                external_video_id=external_video_id,
+                channel=channel,
+                discovered_by_query=query,
+                title=snippet.get("title") or "Без названия",
+                description=snippet.get("description"),
+                url=f"https://www.youtube.com/watch?v={external_video_id}",
+                thumbnail_url=thumbnail_url,
+                published_at=published_at,
+                duration_seconds=duration_seconds,
+                view_count=view_count,
+                like_count=like_count,
+                comment_count=comment_count,
             )
+            db.add(video)
             created += 1
         else:
             video.view_count = view_count
+            video.like_count = like_count
+            video.comment_count = comment_count
             video.thumbnail_url = thumbnail_url or video.thumbnail_url
             video.duration_seconds = duration_seconds or video.duration_seconds
             updated += 1
 
+        video.metric_snapshots.append(
+            VideoMetricSnapshot(
+                view_count=view_count,
+                like_count=like_count,
+                comment_count=comment_count,
+            )
+        )
+
     db.commit()
+    recompute_all_scores(db)
     return {"found": len(videos_raw), "created": created, "updated": updated}
 
 
