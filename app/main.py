@@ -264,7 +264,7 @@ def content_detail(pack_id: uuid.UUID, request: Request, db: Session = Depends(g
 @app.post("/videos/cleanup")
 def cleanup_videos(db: Session = Depends(get_db)):
     removed = cleanup_ineligible_videos(db)
-    message = f"Удалено неподходящих видео (Shorts/короткие): {removed}"
+    message = f"Удалено неподходящих видео (Shorts и иностранные): {removed}"
     return RedirectResponse(f"/videos?ok={quote(message)}", status_code=303)
 
 

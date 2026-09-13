@@ -115,24 +115,60 @@ def _is_eligible(duration_seconds: int | None, snippet: dict, settings) -> bool:
     if duration_seconds is not None and duration_seconds < settings.min_duration_seconds:
         return False
     allowed = settings.allowed_language_set
-    if allowed:
-        lang = snippet.get("defaultAudioLanguage") or snippet.get("defaultLanguage")
-        if lang and lang.split("-")[0].lower() not in allowed:
-            return False
-    return True
+    if not allowed:
+        return True
+    declared = snippet.get("defaultAudioLanguage") or snippet.get("defaultLanguage")
+    text = f"{snippet.get('title', '')} {snippet.get('description', '')}"
+    return _language_allowed(declared, text, allowed)
+
+
+def _language_allowed(declared: str | None, text: str, allowed: set[str]) -> bool:
+    """Keep the video if its language is allowed. Prefer the declared metadata
+    language; otherwise detect from title+description. When detection is
+    uncertain we keep the video (avoid false negatives on good content)."""
+    if declared:
+        return declared.split("-")[0].lower() in allowed
+    detected = _detect_language(text)
+    if detected is None:
+        return True
+    return detected in allowed
+
+
+def _detect_language(text: str) -> str | None:
+    text = (text or "").strip()
+    if len(text) < 15:
+        return None
+    try:
+        from langdetect import DetectorFactory, detect_langs
+
+        DetectorFactory.seed = 0
+        ranked = detect_langs(text[:800])
+    except Exception:
+        return None
+    if not ranked:
+        return None
+    top = ranked[0]
+    # Only trust a confident guess, so we don't wrongly drop good videos.
+    if top.prob < 0.85:
+        return None
+    return top.lang.split("-")[0].lower()
 
 
 def cleanup_ineligible_videos(db: Session) -> int:
     """Removes already-stored videos that would be filtered out today (Shorts /
     foreign language). Cascades to their snapshots, transcripts and packs."""
     settings = get_settings()
+    allowed = settings.allowed_language_set
     removed = 0
     for video in db.scalars(select(Video)).all():
         too_short = (
             video.duration_seconds is not None
             and video.duration_seconds < settings.min_duration_seconds
         )
-        if too_short:
+        foreign = bool(allowed) and not _language_allowed(
+            None, f"{video.title} {video.description or ''}", allowed
+        )
+        if too_short or foreign:
             db.delete(video)
             removed += 1
     db.commit()
