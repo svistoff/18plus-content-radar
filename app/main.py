@@ -17,10 +17,15 @@ from app.database import Base, SessionLocal, engine, get_db
 from app.models import Channel, ContentPack, SearchQuery, Video
 from app.seed import seed_search_queries
 from app.services.ai_content_service import AIContentError, generate_content_pack
-from app.services.discovery_service import run_all_enabled_queries, run_search_for_query
+from app.services.discovery_service import (
+    cleanup_ineligible_videos,
+    run_all_enabled_queries,
+    run_search_for_query,
+)
 from app.services.metrics_service import refresh_all_metrics
 from app.services.scheduler import build_scheduler
 from app.services.scoring_service import recompute_all_scores
+from app.services.settings_service import get_brand_settings
 from app.services.transcript_service import TranscriptUnavailable, fetch_and_store_transcript
 from app.services.youtube_client import YouTubeAPIError
 
@@ -103,6 +108,7 @@ def run_discovery_now(db: Session = Depends(get_db)):
     message = (
         f"Поиск по {totals['queries']} темам: найдено {totals['found']}, "
         f"новых {totals['created']}, обновлено {totals['updated']}"
+        + (f", пропущено Shorts/коротких {totals['skipped']}" if totals["skipped"] else "")
         + (f", ошибок {totals['errors']}" if totals["errors"] else "")
     )
     return RedirectResponse(f"/?ok={quote(message)}", status_code=303)
@@ -169,6 +175,7 @@ def run_query(query_id: uuid.UUID, db: Session = Depends(get_db)):
     message = (
         f"«{query.name}»: найдено {result['found']}, "
         f"новых {result['created']}, обновлено {result['updated']}"
+        + (f", пропущено Shorts/коротких {result.get('skipped', 0)}" if result.get("skipped") else "")
     )
     return RedirectResponse(f"/queries?ok={quote(message)}", status_code=303)
 
@@ -252,3 +259,39 @@ def content_detail(pack_id: uuid.UUID, request: Request, db: Session = Depends(g
         "content_detail.html",
         {"pack": pack, "video": pack.video, "content": json.loads(pack.content_json or "{}")},
     )
+
+
+@app.post("/videos/cleanup")
+def cleanup_videos(db: Session = Depends(get_db)):
+    removed = cleanup_ineligible_videos(db)
+    message = f"Удалено неподходящих видео (Shorts/короткие): {removed}"
+    return RedirectResponse(f"/videos?ok={quote(message)}", status_code=303)
+
+
+@app.get("/settings", response_class=HTMLResponse)
+def settings_page(request: Request, db: Session = Depends(get_db)):
+    brand = get_brand_settings(db)
+    return templates.TemplateResponse(
+        request,
+        "settings.html",
+        {"brand": brand, "ok_message": request.query_params.get("ok")},
+    )
+
+
+@app.post("/settings")
+def save_settings(
+    editorial_style: str = Form(""),
+    target_audience: str = Form(""),
+    blog_cta: str = Form(""),
+    image_style: str = Form(""),
+    custom_instructions: str = Form(""),
+    db: Session = Depends(get_db),
+):
+    brand = get_brand_settings(db)
+    brand.editorial_style = editorial_style.strip()
+    brand.target_audience = target_audience.strip()
+    brand.blog_cta = blog_cta.strip()
+    brand.image_style = image_style.strip()
+    brand.custom_instructions = custom_instructions.strip()
+    db.commit()
+    return RedirectResponse(f"/settings?ok={quote('Настройки сохранены')}", status_code=303)

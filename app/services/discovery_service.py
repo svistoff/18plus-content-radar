@@ -7,6 +7,7 @@ from datetime import datetime
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.config import get_settings
 from app.models import Channel, SearchQuery, Video, VideoMetricSnapshot
 from app.services.scoring_service import recompute_all_scores
 from app.services.youtube_client import YouTubeClient, parse_iso8601_duration
@@ -18,7 +19,7 @@ def run_all_enabled_queries(db: Session) -> dict:
     queries = db.scalars(
         select(SearchQuery).where(SearchQuery.enabled.is_(True)).order_by(SearchQuery.priority.desc())
     ).all()
-    totals = {"queries": 0, "found": 0, "created": 0, "updated": 0, "errors": 0, "error_sample": None}
+    totals = {"queries": 0, "found": 0, "created": 0, "updated": 0, "skipped": 0, "errors": 0, "error_sample": None}
     for query in queries:
         totals["queries"] += 1
         try:
@@ -32,10 +33,12 @@ def run_all_enabled_queries(db: Session) -> dict:
         totals["found"] += result["found"]
         totals["created"] += result["created"]
         totals["updated"] += result["updated"]
+        totals["skipped"] += result.get("skipped", 0)
     return totals
 
 
 def run_search_for_query(db: Session, query: SearchQuery) -> dict:
+    settings = get_settings()
     client = YouTubeClient()
     video_ids = client.search_video_ids(query.query_text, query.language)
     videos_raw = client.get_videos(video_ids)
@@ -45,6 +48,7 @@ def run_search_for_query(db: Session, query: SearchQuery) -> dict:
 
     created = 0
     updated = 0
+    skipped = 0
 
     for item in videos_raw:
         snippet = item.get("snippet") or {}
@@ -55,6 +59,11 @@ def run_search_for_query(db: Session, query: SearchQuery) -> dict:
         if not external_video_id or not external_channel_id:
             continue
 
+        duration_seconds = parse_iso8601_duration(content_details.get("duration"))
+        if not _is_eligible(duration_seconds, snippet, settings):
+            skipped += 1
+            continue
+
         channel = _upsert_channel(db, external_channel_id, snippet, channels_raw.get(external_channel_id, {}))
 
         video = db.scalar(select(Video).where(Video.external_video_id == external_video_id))
@@ -62,7 +71,6 @@ def run_search_for_query(db: Session, query: SearchQuery) -> dict:
         like_count = _safe_int(statistics.get("likeCount")) or 0
         comment_count = _safe_int(statistics.get("commentCount")) or 0
         published_at = _parse_datetime(snippet.get("publishedAt"))
-        duration_seconds = parse_iso8601_duration(content_details.get("duration"))
         thumbnail_url = _pick_thumbnail(snippet.get("thumbnails"))
 
         if video is None:
@@ -100,7 +108,37 @@ def run_search_for_query(db: Session, query: SearchQuery) -> dict:
 
     db.commit()
     recompute_all_scores(db)
-    return {"found": len(videos_raw), "created": created, "updated": updated}
+    return {"found": len(videos_raw), "created": created, "updated": updated, "skipped": skipped}
+
+
+def _is_eligible(duration_seconds: int | None, snippet: dict, settings) -> bool:
+    if duration_seconds is not None and duration_seconds < settings.min_duration_seconds:
+        return False
+    allowed = settings.allowed_language_set
+    if allowed:
+        lang = snippet.get("defaultAudioLanguage") or snippet.get("defaultLanguage")
+        if lang and lang.split("-")[0].lower() not in allowed:
+            return False
+    return True
+
+
+def cleanup_ineligible_videos(db: Session) -> int:
+    """Removes already-stored videos that would be filtered out today (Shorts /
+    foreign language). Cascades to their snapshots, transcripts and packs."""
+    settings = get_settings()
+    removed = 0
+    for video in db.scalars(select(Video)).all():
+        too_short = (
+            video.duration_seconds is not None
+            and video.duration_seconds < settings.min_duration_seconds
+        )
+        if too_short:
+            db.delete(video)
+            removed += 1
+    db.commit()
+    if removed:
+        recompute_all_scores(db)
+    return removed
 
 
 def _upsert_channel(db: Session, external_channel_id: str, video_snippet: dict, channel_raw: dict) -> Channel:

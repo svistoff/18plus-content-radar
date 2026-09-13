@@ -80,6 +80,23 @@ class VideoMetricSnapshot(Base):
     video: Mapped[Video] = relationship(back_populates="metric_snapshots")
 
 
+class BrandSettings(Base):
+    """Single editable row with the editor's style/brand instructions that get
+    injected into every AI generation prompt."""
+
+    __tablename__ = "brand_settings"
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    editorial_style: Mapped[str] = mapped_column(Text, default="")
+    target_audience: Mapped[str] = mapped_column(Text, default="")
+    blog_cta: Mapped[str] = mapped_column(Text, default="")
+    image_style: Mapped[str] = mapped_column(Text, default="")
+    custom_instructions: Mapped[str] = mapped_column(Text, default="")
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
 class Transcript(Base):
     __tablename__ = "transcripts"
 

@@ -19,7 +19,16 @@ class Settings(BaseSettings):
     search_interval_hours: int = 12
     metrics_interval_hours: int = 6
 
+    # Отсекаем Shorts и слишком короткие клипы (в них мало материала для статьи).
+    min_duration_seconds: int = 180
+    # Мягкий фильтр языка по метаданным видео (пусто = не фильтровать).
+    allowed_languages: str = "ru,en"
+
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+
+    @property
+    def allowed_language_set(self) -> set[str]:
+        return {x.strip().lower() for x in self.allowed_languages.split(",") if x.strip()}
 
     @field_validator("ai_model", mode="before")
     @classmethod
