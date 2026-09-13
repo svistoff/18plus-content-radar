@@ -14,12 +14,14 @@ from sqlalchemy.orm import Session, joinedload
 
 from app.config import get_settings
 from app.database import Base, SessionLocal, engine, get_db
-from app.models import Channel, SearchQuery, Video
+from app.models import Channel, ContentPack, SearchQuery, Video
 from app.seed import seed_search_queries
+from app.services.ai_content_service import AIContentError, generate_content_pack
 from app.services.discovery_service import run_all_enabled_queries, run_search_for_query
 from app.services.metrics_service import refresh_all_metrics
 from app.services.scheduler import build_scheduler
 from app.services.scoring_service import recompute_all_scores
+from app.services.transcript_service import TranscriptUnavailable, fetch_and_store_transcript
 from app.services.youtube_client import YouTubeAPIError
 
 logging.getLogger("radar").setLevel(logging.INFO)
@@ -182,15 +184,71 @@ def recompute_scores(db: Session = Depends(get_db)):
 def videos_page(request: Request, db: Session = Depends(get_db)):
     videos = db.scalars(
         select(Video)
-        .options(joinedload(Video.channel))
+        .options(joinedload(Video.channel), joinedload(Video.content_packs))
         .order_by(Video.viral_score.desc(), Video.published_at.desc().nullslast())
-    ).all()
+    ).unique().all()
     items = [
-        {"video": video, "why": json.loads(video.score_explanation or "[]")}
+        {
+            "video": video,
+            "why": json.loads(video.score_explanation or "[]"),
+            "has_pack": bool(video.content_packs),
+        }
         for video in videos
     ]
     return templates.TemplateResponse(
         request,
         "videos.html",
-        {"items": items, "ok_message": request.query_params.get("ok")},
+        {
+            "items": items,
+            "ok_message": request.query_params.get("ok"),
+            "error_message": request.query_params.get("error"),
+        },
+    )
+
+
+@app.post("/videos/{video_id}/produce")
+def produce_content(video_id: uuid.UUID, db: Session = Depends(get_db)):
+    video = db.get(Video, video_id)
+    if not video:
+        raise HTTPException(status_code=404, detail="Видео не найдено")
+
+    video.workflow_status = "selected"
+    db.commit()
+
+    try:
+        transcript = video.transcript
+        if transcript is None or transcript.status != "ready":
+            transcript = fetch_and_store_transcript(db, video)
+    except TranscriptUnavailable as exc:
+        video.workflow_status = "transcript_failed"
+        db.commit()
+        return RedirectResponse(f"/videos?error={quote(str(exc))}", status_code=303)
+
+    try:
+        pack = generate_content_pack(db, video, transcript)
+    except AIContentError as exc:
+        return RedirectResponse(f"/videos?error={quote(str(exc))}", status_code=303)
+
+    return RedirectResponse(f"/content/{pack.id}", status_code=303)
+
+
+@app.get("/content", response_class=HTMLResponse)
+def content_list(request: Request, db: Session = Depends(get_db)):
+    packs = db.scalars(
+        select(ContentPack)
+        .options(joinedload(ContentPack.video).joinedload(Video.channel))
+        .order_by(ContentPack.created_at.desc())
+    ).all()
+    return templates.TemplateResponse(request, "content_list.html", {"packs": packs})
+
+
+@app.get("/content/{pack_id}", response_class=HTMLResponse)
+def content_detail(pack_id: uuid.UUID, request: Request, db: Session = Depends(get_db)):
+    pack = db.get(ContentPack, pack_id)
+    if not pack:
+        raise HTTPException(status_code=404, detail="Материал не найден")
+    return templates.TemplateResponse(
+        request,
+        "content_detail.html",
+        {"pack": pack, "video": pack.video, "content": json.loads(pack.content_json or "{}")},
     )

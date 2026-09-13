@@ -1,0 +1,26 @@
+{% extends "base.html" %}{% block content %}
+{% set a = content.blog_article %}
+<h1>{{ a.h1 if a and a.h1 else video.title }}</h1>
+
+<section class="panel source-card"><h2>Источник</h2><ul class="src"><li><b>Видео:</b> <a href="{{ video.url }}" target="_blank">{{ video.title }}</a></li><li><b>Канал:</b> {{ video.channel.title if video.channel else '—' }}</li><li><b>Опубликовано:</b> {{ video.published_at.strftime('%d.%m.%Y') if video.published_at else '—' }}</li><li><b>Просмотры:</b> {{ '{:,}'.format(video.view_count).replace(',', ' ') }}</li></ul><p class="hint">Материал — оригинальная редакционная переработка. Транскрипт использован как источник фактов, не копируется дословно. Проверьте текст перед публикацией.</p>{% if video.transcript %}<details><summary>Показать транскрипт ({{ video.transcript.language or '—' }})</summary><p class="transcript">{{ video.transcript.raw_text }}</p></details>{% endif %}</section>
+
+<section class="panel toolbar"><form method="post" action="/videos/{{ video.id }}/produce"><button class="secondary">Пересоздать материал</button></form><a class="btn-good" href="/content">← Ко всем материалам</a></section>
+
+{% if a %}<section class="panel"><h2>Статья</h2>{% if a.seo_title %}<p class="kv"><b>SEO title:</b> {{ a.seo_title }}</p>{% endif %}{% if a.seo_description %}<p class="kv"><b>SEO description:</b> {{ a.seo_description }}</p>{% endif %}{% if a.slug_suggestion %}<p class="kv"><b>Slug:</b> {{ a.slug_suggestion }}</p>{% endif %}{% if a.intro %}<p>{{ a.intro }}</p>{% endif %}{% for s in a.sections or [] %}<h3>{{ s.h2 }}</h3><p class="pre">{{ s.body_markdown }}</p>{% endfor %}{% if a.faq %}<h3>FAQ</h3>{% for q in a.faq %}<p class="kv"><b>{{ q.question }}</b><br>{{ q.answer }}</p>{% endfor %}{% endif %}{% if a.conclusion %}<h3>Вывод</h3><p>{{ a.conclusion }}</p>{% endif %}{% if a.editorial_disclaimer %}<p class="hint">{{ a.editorial_disclaimer }}</p>{% endif %}</section>{% endif %}
+
+{% if content.headlines %}<section class="panel"><h2>Заголовки</h2><ul>{% for h in content.headlines %}<li>{{ h }}</li>{% endfor %}</ul></section>{% endif %}
+
+{% if content.instagram_carousel %}{% set c = content.instagram_carousel %}<section class="panel"><h2>Instagram-карусель</h2>{% if c.cover_headline %}<p class="kv"><b>Обложка:</b> {{ c.cover_headline }}</p>{% endif %}{% for sl in c.slides or [] %}<p class="kv"><b>Слайд {{ sl.slide_number or loop.index }}: {{ sl.headline }}</b><br>{{ sl.body }}</p>{% endfor %}{% if c.caption %}<p class="kv"><b>Подпись:</b> {{ c.caption }}</p>{% endif %}{% if c.cta %}<p class="kv"><b>CTA:</b> {{ c.cta }}</p>{% endif %}</section>{% endif %}
+
+{% if content.reels %}<section class="panel"><h2>Reels</h2>{% for r in content.reels %}<div class="block"><p class="kv"><b>Хук:</b> {{ r.hook }}{% if r.duration_seconds %} · {{ r.duration_seconds }} сек{% endif %}</p>{% if r.script %}<p class="pre">{{ r.script }}</p>{% endif %}{% if r.cta %}<p class="kv"><b>CTA:</b> {{ r.cta }}</p>{% endif %}</div>{% endfor %}</section>{% endif %}
+
+{% if content.vk_posts %}<section class="panel"><h2>VK-посты</h2>{% for p in content.vk_posts %}<div class="block">{% if p.headline %}<p class="kv"><b>{{ p.headline }}</b></p>{% endif %}<p class="pre">{{ p.body }}</p>{% if p.cta %}<p class="kv"><b>CTA:</b> {{ p.cta }}</p>{% endif %}</div>{% endfor %}</section>{% endif %}
+
+{% if content.zen %}{% set z = content.zen %}<section class="panel"><h2>Дзен</h2>{% if z.headline %}<p class="kv"><b>{{ z.headline }}</b></p>{% endif %}{% if z.lead %}<p>{{ z.lead }}</p>{% endif %}{% if z.body_markdown %}<p class="pre">{{ z.body_markdown }}</p>{% endif %}</section>{% endif %}
+
+{% if content.telegram_teasers %}<section class="panel"><h2>Telegram-тизеры</h2>{% for t in content.telegram_teasers %}<div class="block"><p class="pre">{{ t.text }}</p>{% if t.cta %}<p class="kv"><b>CTA:</b> {{ t.cta }}</p>{% endif %}</div>{% endfor %}</section>{% endif %}
+
+{% if content.illustration_prompts %}<section class="panel"><h2>Промпты для иллюстраций</h2><p class="hint">Изображения не генерируются автоматически — проверьте промпты и создайте картинки сами.</p>{% for p in content.illustration_prompts %}<div class="block"><p class="kv"><b>{{ p.placement }}</b></p><p class="pre">{{ p.prompt }}</p>{% if p.negative_prompt %}<p class="hint">negative: {{ p.negative_prompt }}</p>{% endif %}</div>{% endfor %}</section>{% endif %}
+
+{% if content.editor_notes %}<section class="panel"><h2>Заметки редактору</h2><ul>{% for n in content.editor_notes %}<li>{{ n }}</li>{% endfor %}</ul></section>{% endif %}
+{% endblock %}

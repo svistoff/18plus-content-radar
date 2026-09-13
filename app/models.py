@@ -60,6 +60,12 @@ class Video(Base):
     metric_snapshots: Mapped[list["VideoMetricSnapshot"]] = relationship(
         back_populates="video", cascade="all, delete-orphan"
     )
+    transcript: Mapped["Transcript | None"] = relationship(
+        back_populates="video", cascade="all, delete-orphan", uselist=False
+    )
+    content_packs: Mapped[list["ContentPack"]] = relationship(
+        back_populates="video", cascade="all, delete-orphan"
+    )
 
 
 class VideoMetricSnapshot(Base):
@@ -72,3 +78,35 @@ class VideoMetricSnapshot(Base):
     like_count: Mapped[int] = mapped_column(Integer, default=0)
     comment_count: Mapped[int] = mapped_column(Integer, default=0)
     video: Mapped[Video] = relationship(back_populates="metric_snapshots")
+
+
+class Transcript(Base):
+    __tablename__ = "transcripts"
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    video_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("videos.id"), unique=True)
+    provider: Mapped[str] = mapped_column(String(30), default="youtube_captions")
+    language: Mapped[str | None] = mapped_column(String(10), nullable=True)
+    raw_text: Mapped[str] = mapped_column(Text, default="")
+    segments: Mapped[str | None] = mapped_column(Text, nullable=True)
+    status: Mapped[str] = mapped_column(String(20), default="ready")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    video: Mapped[Video] = relationship(back_populates="transcript")
+
+
+class ContentPack(Base):
+    __tablename__ = "content_packs"
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    video_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("videos.id"))
+    transcript_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("transcripts.id"), nullable=True
+    )
+    status: Mapped[str] = mapped_column(String(20), default="draft")
+    model: Mapped[str | None] = mapped_column(String(60), nullable=True)
+    content_json: Mapped[str] = mapped_column(Text, default="{}")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+    video: Mapped[Video] = relationship(back_populates="content_packs")
