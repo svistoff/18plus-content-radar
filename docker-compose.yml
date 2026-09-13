@@ -3,7 +3,7 @@ services:
     build: .
     env_file: .env
     ports:
-      - "8000:8000"
+      - "${WEB_PORT:-8000}:8000"
     depends_on:
       postgres:
         condition: service_healthy
@@ -16,8 +16,6 @@ services:
       POSTGRES_DB: radar
       POSTGRES_USER: radar
       POSTGRES_PASSWORD: radar
-    ports:
-      - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
