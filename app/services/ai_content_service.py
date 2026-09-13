@@ -175,17 +175,53 @@ def _chat_completion(system_prompt: str, user_prompt: str) -> str:
         client_kwargs["base_url"] = settings.ai_base_url
     client = OpenAI(**client_kwargs)
 
-    response = client.chat.completions.create(
-        model=settings.ai_model,
-        messages=[
+    params = {
+        "model": settings.ai_model,
+        "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ],
-        response_format={"type": "json_object"},
-        temperature=0.8,
-        max_tokens=MAX_OUTPUT_TOKENS,
-    )
+        "response_format": {"type": "json_object"},
+        "temperature": 0.8,
+        "max_completion_tokens": MAX_OUTPUT_TOKENS,
+    }
+    response = _create_resilient(client, params)
     return response.choices[0].message.content or ""
+
+
+def _create_resilient(client, params: dict):
+    """Different OpenAI models accept different parameters (e.g. newer models
+    require max_completion_tokens and only allow the default temperature). If the
+    API rejects a parameter, adapt and retry instead of failing the generation."""
+    last_exc = None
+    for _ in range(5):
+        try:
+            return client.chat.completions.create(**params)
+        except Exception as exc:
+            if not _adapt_params(params, exc):
+                raise
+            last_exc = exc
+    if last_exc:
+        raise last_exc
+
+
+def _adapt_params(params: dict, exc: Exception) -> bool:
+    low = str(getattr(exc, "message", "") or exc).lower()
+    if "max_tokens" in low and "max_completion_tokens" not in params:
+        params.pop("max_tokens", None)
+        params["max_completion_tokens"] = MAX_OUTPUT_TOKENS
+        return True
+    if "max_completion_tokens" in low and "max_tokens" not in params:
+        params.pop("max_completion_tokens", None)
+        params["max_tokens"] = MAX_OUTPUT_TOKENS
+        return True
+    if "temperature" in low and "temperature" in params:
+        params.pop("temperature")
+        return True
+    if "response_format" in low and "response_format" in params:
+        params.pop("response_format")
+        return True
+    return False
 
 
 def _parse_json(raw: str) -> dict:
