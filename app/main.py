@@ -1,4 +1,5 @@
 import json
+import logging
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -11,12 +12,19 @@ from fastapi.templating import Jinja2Templates
 from sqlalchemy import func, select, text
 from sqlalchemy.orm import Session, joinedload
 
+from app.config import get_settings
 from app.database import Base, SessionLocal, engine, get_db
 from app.models import Channel, SearchQuery, Video
 from app.seed import seed_search_queries
-from app.services.discovery_service import run_search_for_query
+from app.services.discovery_service import run_all_enabled_queries, run_search_for_query
+from app.services.metrics_service import refresh_all_metrics
+from app.services.scheduler import build_scheduler
 from app.services.scoring_service import recompute_all_scores
 from app.services.youtube_client import YouTubeAPIError
+
+logging.getLogger("radar").setLevel(logging.INFO)
+if not logging.getLogger().handlers:
+    logging.basicConfig(level=logging.INFO)
 
 BASE_DIR = Path(__file__).resolve().parent
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
@@ -41,7 +49,12 @@ async def lifespan(app: FastAPI):
                 conn.execute(text(statement))
     with SessionLocal() as db:
         seed_search_queries(db)
-    yield
+    scheduler = build_scheduler()
+    try:
+        yield
+    finally:
+        if scheduler is not None:
+            scheduler.shutdown(wait=False)
 
 
 app = FastAPI(title="18plus Content Radar", lifespan=lifespan)
@@ -55,13 +68,52 @@ def health():
 
 @app.get("/", response_class=HTMLResponse)
 def dashboard(request: Request, db: Session = Depends(get_db)):
+    settings = get_settings()
     stats = {
         "queries": db.scalar(select(func.count()).select_from(SearchQuery)) or 0,
         "videos": db.scalar(select(func.count()).select_from(Video)) or 0,
         "watchlist": db.scalar(select(func.count()).select_from(Channel).where(Channel.status == "watchlist")) or 0,
         "selected": db.scalar(select(func.count()).select_from(Video).where(Video.workflow_status == "selected")) or 0,
     }
-    return templates.TemplateResponse(request, "dashboard.html", {"stats": stats})
+    schedule = {
+        "enabled": settings.scheduler_enabled,
+        "search_interval_hours": settings.search_interval_hours,
+        "metrics_interval_hours": settings.metrics_interval_hours,
+    }
+    return templates.TemplateResponse(
+        request,
+        "dashboard.html",
+        {
+            "stats": stats,
+            "schedule": schedule,
+            "ok_message": request.query_params.get("ok"),
+            "error_message": request.query_params.get("error"),
+        },
+    )
+
+
+@app.post("/jobs/discovery/run")
+def run_discovery_now(db: Session = Depends(get_db)):
+    totals = run_all_enabled_queries(db)
+    if totals["found"] == 0 and totals["errors"]:
+        reason = totals["error_sample"] or "все запросы завершились ошибкой"
+        return RedirectResponse(f"/?error={quote(reason)}", status_code=303)
+    message = (
+        f"Поиск по {totals['queries']} темам: найдено {totals['found']}, "
+        f"новых {totals['created']}, обновлено {totals['updated']}"
+        + (f", ошибок {totals['errors']}" if totals["errors"] else "")
+    )
+    return RedirectResponse(f"/?ok={quote(message)}", status_code=303)
+
+
+@app.post("/jobs/metrics/run")
+def run_metrics_now(db: Session = Depends(get_db)):
+    try:
+        totals = refresh_all_metrics(db)
+    except YouTubeAPIError as exc:
+        return RedirectResponse(f"/?error={quote(str(exc))}", status_code=303)
+    message = f"Метрики обновлены: {totals['refreshed']} из {totals['tracked']} видео"
+    return RedirectResponse(f"/?ok={quote(message)}", status_code=303)
 
 
 @app.get("/queries", response_class=HTMLResponse)

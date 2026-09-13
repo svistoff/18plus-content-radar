@@ -12,6 +12,10 @@ class Settings(BaseSettings):
     youtube_max_results: int = 25
     ai_api_key: str = ""
 
+    scheduler_enabled: bool = True
+    search_interval_hours: int = 12
+    metrics_interval_hours: int = 6
+
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
 

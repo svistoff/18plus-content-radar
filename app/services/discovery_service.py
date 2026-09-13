@@ -12,6 +12,29 @@ from app.services.scoring_service import recompute_all_scores
 from app.services.youtube_client import YouTubeClient, parse_iso8601_duration
 
 
+def run_all_enabled_queries(db: Session) -> dict:
+    """Runs discovery for every enabled search query. Used by the scheduler and
+    the manual 'search now' button. One failing query does not abort the rest."""
+    queries = db.scalars(
+        select(SearchQuery).where(SearchQuery.enabled.is_(True)).order_by(SearchQuery.priority.desc())
+    ).all()
+    totals = {"queries": 0, "found": 0, "created": 0, "updated": 0, "errors": 0, "error_sample": None}
+    for query in queries:
+        totals["queries"] += 1
+        try:
+            result = run_search_for_query(db, query)
+        except Exception as exc:
+            db.rollback()
+            totals["errors"] += 1
+            if totals["error_sample"] is None:
+                totals["error_sample"] = str(exc)
+            continue
+        totals["found"] += result["found"]
+        totals["created"] += result["created"]
+        totals["updated"] += result["updated"]
+    return totals
+
+
 def run_search_for_query(db: Session, query: SearchQuery) -> dict:
     client = YouTubeClient()
     video_ids = client.search_video_ids(query.query_text, query.language)
