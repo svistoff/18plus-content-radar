@@ -1,11 +1,14 @@
-"""Fetches a video transcript from YouTube captions via yt-dlp.
+"""Fetches a video transcript, resilient to YouTube blocking a server IP.
 
-yt-dlp both discovers the caption track and downloads it. We let yt-dlp do the
-download (rather than fetching the caption URL ourselves) because a bare request
-to YouTube's timedtext endpoint from a datacenter IP gets rate-limited (HTTP
-429); yt-dlp uses proper client context and retries and is far more reliable.
-The transcript is a research source only; a video with no ru/en captions is
-marked so the UI can explain why (a Whisper/STT fallback can be added later).
+Order of attempts:
+1. Apify (if configured) — fetches captions on Apify's infrastructure, which
+   bypasses the HTTP 429 that YouTube returns to datacenter IPs, and costs a
+   fraction of a cent per transcript.
+2. yt-dlp captions — direct caption download; works when the IP isn't blocked.
+3. Audio STT (OpenAI-compatible, e.g. Groq whisper-large-v3-turbo) — for videos
+   with no captions at all.
+
+The transcript is a research source only.
 """
 
 from __future__ import annotations
@@ -16,6 +19,7 @@ import os
 import shutil
 import tempfile
 
+import httpx
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
@@ -32,21 +36,36 @@ class TranscriptUnavailable(RuntimeError):
 def fetch_and_store_transcript(db: Session, video: Video) -> Transcript:
     settings = get_settings()
     languages = list(dict.fromkeys([settings.youtube_default_language, *PREFERRED_LANGUAGES]))
-    provider = "yt_dlp_captions"
 
-    try:
-        segments, language = _fetch_segments(video.external_video_id, languages)
-    except TranscriptUnavailable as caption_exc:
-        if not (settings.whisper_fallback and settings.ai_api_key):
-            raise
+    segments = language = provider = None
+    caption_error = None
+
+    if settings.apify_token:
         try:
-            segments, language = _transcribe_with_whisper(video.external_video_id)
-            provider = "whisper"
-        except TranscriptUnavailable as whisper_exc:
-            raise TranscriptUnavailable(
-                f"Субтитры недоступны ({caption_exc}). "
-                f"Распознавание аудио тоже не удалось ({whisper_exc})."
-            ) from whisper_exc
+            segments, language = _from_apify(video.external_video_id)
+            provider = "apify"
+        except TranscriptUnavailable as exc:
+            caption_error = exc
+    else:
+        try:
+            segments, language = _fetch_segments(video.external_video_id, languages)
+            provider = "yt_dlp_captions"
+        except TranscriptUnavailable as exc:
+            caption_error = exc
+
+    if segments is None:
+        transcribe_key, _ = settings.transcribe_credentials()
+        if settings.whisper_fallback and transcribe_key:
+            try:
+                segments, language = _transcribe_with_whisper(video.external_video_id)
+                provider = "audio_stt"
+            except TranscriptUnavailable as whisper_exc:
+                raise TranscriptUnavailable(
+                    f"Субтитры недоступны ({caption_error}). "
+                    f"Распознавание аудио тоже не удалось ({whisper_exc})."
+                ) from whisper_exc
+        else:
+            raise caption_error or TranscriptUnavailable("Транскрипт недоступен.")
 
     raw_text = " ".join(seg["text"].strip() for seg in segments if seg.get("text")).strip()
     if not raw_text:
@@ -68,9 +87,98 @@ def fetch_and_store_transcript(db: Session, video: Video) -> Transcript:
     return transcript
 
 
+def _from_apify(video_id: str) -> tuple[list[dict], str | None]:
+    """Runs an Apify YouTube-transcript actor server-side (bypasses the 429 that
+    YouTube returns to our IP) and parses whatever shape it returns."""
+    settings = get_settings()
+    endpoint = (
+        f"https://api.apify.com/v2/acts/{settings.apify_actor}"
+        f"/run-sync-get-dataset-items?token={settings.apify_token}"
+    )
+    payload = {"videoUrl": f"https://www.youtube.com/watch?v={video_id}"}
+    try:
+        response = httpx.post(endpoint, json=payload, timeout=180.0)
+    except httpx.HTTPError as exc:
+        raise TranscriptUnavailable(f"Apify недоступен: {exc}") from exc
+    if response.status_code not in (200, 201):
+        raise TranscriptUnavailable(
+            f"Apify вернул {response.status_code}: {response.text[:200]}"
+        )
+    try:
+        data = response.json()
+    except ValueError as exc:
+        raise TranscriptUnavailable("Apify вернул не-JSON ответ") from exc
+
+    segments = _parse_apify(data)
+    if not segments:
+        raise TranscriptUnavailable(
+            "Apify не вернул субтитры (у видео их нет или изменился формат актора). "
+            f"Ответ: {str(data)[:200]}"
+        )
+    return segments, None
+
+
+def _parse_apify(data) -> list[dict]:
+    segments: list[dict] = []
+    items = data if isinstance(data, list) else [data]
+    for item in items:
+        if isinstance(item, str):
+            _push(segments, item)
+            continue
+        if not isinstance(item, dict):
+            continue
+        for key in ("data", "segments", "captions", "transcript", "subtitles"):
+            value = item.get(key)
+            if isinstance(value, list):
+                _push_segments(segments, value)
+        if isinstance(item.get("transcript"), str):
+            _push(segments, item["transcript"])
+        text = item.get("text")
+        if isinstance(text, str):
+            if any(k in item for k in ("start", "offset", "startMs", "dur", "duration")):
+                _push_segments(segments, [item])
+            elif not segments:
+                _push(segments, text)
+    return segments
+
+
+def _push_segments(segments: list[dict], seglist) -> None:
+    for seg in seglist:
+        if isinstance(seg, str):
+            _push(segments, seg)
+            continue
+        if not isinstance(seg, dict):
+            continue
+        start = seg.get("start", seg.get("offset"))
+        if start is None and seg.get("startMs") is not None:
+            start = _f(seg["startMs"]) / 1000
+        dur = seg.get("dur", seg.get("duration"))
+        if dur is None and seg.get("durationMs") is not None:
+            dur = _f(seg["durationMs"]) / 1000
+        _push(segments, seg.get("text") or seg.get("utf8"), start, dur)
+
+
+def _push(segments: list[dict], text, start=0, dur=0) -> None:
+    clean = (text or "").strip()
+    if not clean:
+        return
+    start_s = _f(start)
+    segments.append(
+        {"start_seconds": round(start_s, 2), "end_seconds": round(start_s + _f(dur), 2), "text": clean}
+    )
+
+
+def _f(value) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def _transcribe_with_whisper(video_id: str) -> tuple[list[dict], str | None]:
     """Downloads a low-bitrate audio track (via a CDN path that is not the
-    rate-limited caption endpoint) and transcribes it with OpenAI Whisper."""
+    rate-limited caption endpoint) and transcribes it with an OpenAI-compatible
+    STT model (OpenAI Whisper or, cheaper, Groq whisper-large-v3-turbo)."""
     settings = get_settings()
     try:
         import yt_dlp
@@ -104,9 +212,10 @@ def _transcribe_with_whisper(video_id: str) -> tuple[list[dict], str | None]:
 
         from openai import OpenAI
 
-        client_kwargs = {"api_key": settings.ai_api_key}
-        if settings.ai_base_url:
-            client_kwargs["base_url"] = settings.ai_base_url
+        api_key, base_url = settings.transcribe_credentials()
+        client_kwargs = {"api_key": api_key}
+        if base_url:
+            client_kwargs["base_url"] = base_url
         client = OpenAI(**client_kwargs)
 
         try:
