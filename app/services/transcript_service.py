@@ -32,21 +32,32 @@ class TranscriptUnavailable(RuntimeError):
 def fetch_and_store_transcript(db: Session, video: Video) -> Transcript:
     settings = get_settings()
     languages = list(dict.fromkeys([settings.youtube_default_language, *PREFERRED_LANGUAGES]))
+    provider = "yt_dlp_captions"
 
-    segments, language = _fetch_segments(video.external_video_id, languages)
+    try:
+        segments, language = _fetch_segments(video.external_video_id, languages)
+    except TranscriptUnavailable as caption_exc:
+        if not (settings.whisper_fallback and settings.ai_api_key):
+            raise
+        try:
+            segments, language = _transcribe_with_whisper(video.external_video_id)
+            provider = "whisper"
+        except TranscriptUnavailable as whisper_exc:
+            raise TranscriptUnavailable(
+                f"Субтитры недоступны ({caption_exc}). "
+                f"Распознавание аудио тоже не удалось ({whisper_exc})."
+            ) from whisper_exc
+
     raw_text = " ".join(seg["text"].strip() for seg in segments if seg.get("text")).strip()
     if not raw_text:
-        raise TranscriptUnavailable(
-            "У видео нет субтитров на русском или английском. Для таких роликов "
-            "позже можно добавить распознавание аудио (Whisper)."
-        )
+        raise TranscriptUnavailable("Транскрипт получен, но оказался пустым.")
 
     transcript = video.transcript
     if transcript is None:
         transcript = Transcript(video=video)
         db.add(transcript)
 
-    transcript.provider = "yt_dlp_captions"
+    transcript.provider = provider
     transcript.language = language
     transcript.raw_text = raw_text
     transcript.segments = json.dumps(segments, ensure_ascii=False)
@@ -55,6 +66,84 @@ def fetch_and_store_transcript(db: Session, video: Video) -> Transcript:
     video.workflow_status = "transcript_ready"
     db.commit()
     return transcript
+
+
+def _transcribe_with_whisper(video_id: str) -> tuple[list[dict], str | None]:
+    """Downloads a low-bitrate audio track (via a CDN path that is not the
+    rate-limited caption endpoint) and transcribes it with OpenAI Whisper."""
+    settings = get_settings()
+    try:
+        import yt_dlp
+    except ImportError as exc:  # pragma: no cover
+        raise TranscriptUnavailable("Библиотека yt-dlp не установлена") from exc
+
+    tmpdir = tempfile.mkdtemp(prefix="audio_")
+    try:
+        opts = {
+            "format": "139/bestaudio[abr<=70]/bestaudio/best",
+            "outtmpl": os.path.join(tmpdir, "%(id)s.%(ext)s"),
+            "quiet": True,
+            "no_warnings": True,
+            "retries": 5,
+            "extractor_retries": 3,
+        }
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                ydl.download([f"https://www.youtube.com/watch?v={video_id}"])
+        except Exception as exc:
+            raise TranscriptUnavailable(f"не удалось скачать аудио: {str(exc)[:160]}") from exc
+
+        files = [p for p in glob.glob(os.path.join(tmpdir, f"{video_id}.*"))]
+        if not files:
+            raise TranscriptUnavailable("аудио не скачалось")
+        audio_path = files[0]
+        if os.path.getsize(audio_path) > 24 * 1024 * 1024:
+            raise TranscriptUnavailable(
+                "ролик слишком длинный для распознавания одним запросом (аудио > 24 МБ)"
+            )
+
+        from openai import OpenAI
+
+        client_kwargs = {"api_key": settings.ai_api_key}
+        if settings.ai_base_url:
+            client_kwargs["base_url"] = settings.ai_base_url
+        client = OpenAI(**client_kwargs)
+
+        try:
+            with open(audio_path, "rb") as fh:
+                result = client.audio.transcriptions.create(
+                    model=settings.whisper_model,
+                    file=fh,
+                    response_format="verbose_json",
+                )
+        except Exception as exc:
+            raise TranscriptUnavailable(f"ошибка Whisper: {str(exc)[:160]}") from exc
+
+        segments = _whisper_segments(result)
+        language = getattr(result, "language", None)
+        if not segments:
+            raise TranscriptUnavailable("Whisper вернул пустой результат")
+        return segments, language
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def _whisper_segments(result) -> list[dict]:
+    segments = []
+    for seg in getattr(result, "segments", None) or []:
+        text = (getattr(seg, "text", None) or (seg.get("text") if isinstance(seg, dict) else "")).strip()
+        if not text:
+            continue
+        start = getattr(seg, "start", None) if not isinstance(seg, dict) else seg.get("start", 0)
+        end = getattr(seg, "end", None) if not isinstance(seg, dict) else seg.get("end", 0)
+        segments.append(
+            {"start_seconds": round(float(start or 0), 2), "end_seconds": round(float(end or 0), 2), "text": text}
+        )
+    if not segments:
+        text = (getattr(result, "text", "") or "").strip()
+        if text:
+            segments = [{"start_seconds": 0.0, "end_seconds": 0.0, "text": text}]
+    return segments
 
 
 def _fetch_segments(video_id: str, languages: list[str]) -> tuple[list[dict], str | None]:

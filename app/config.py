@@ -14,6 +14,9 @@ class Settings(BaseSettings):
     ai_api_key: str = ""
     ai_model: str = "gpt-4o-mini"
     ai_base_url: str = ""
+    # Fallback: если субтитры недоступны (429/нет), распознать аудио через OpenAI.
+    whisper_fallback: bool = True
+    whisper_model: str = "whisper-1"
 
     scheduler_enabled: bool = True
     search_interval_hours: int = 12
