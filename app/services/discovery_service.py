@@ -52,11 +52,8 @@ def run_search_for_query(db: Session, query: SearchQuery) -> dict:
 
     for item in videos_raw:
         snippet = item.get("snippet") or {}
-        statistics = item.get("statistics") or {}
         content_details = item.get("contentDetails") or {}
-        external_video_id = item.get("id")
-        external_channel_id = snippet.get("channelId")
-        if not external_video_id or not external_channel_id:
+        if not item.get("id") or not snippet.get("channelId"):
             continue
 
         duration_seconds = parse_iso8601_duration(content_details.get("duration"))
@@ -64,51 +61,69 @@ def run_search_for_query(db: Session, query: SearchQuery) -> dict:
             skipped += 1
             continue
 
-        channel = _upsert_channel(db, external_channel_id, snippet, channels_raw.get(external_channel_id, {}))
-
-        video = db.scalar(select(Video).where(Video.external_video_id == external_video_id))
-        view_count = _safe_int(statistics.get("viewCount")) or 0
-        like_count = _safe_int(statistics.get("likeCount")) or 0
-        comment_count = _safe_int(statistics.get("commentCount")) or 0
-        published_at = _parse_datetime(snippet.get("publishedAt"))
-        thumbnail_url = _pick_thumbnail(snippet.get("thumbnails"))
-
-        if video is None:
-            video = Video(
-                external_video_id=external_video_id,
-                channel=channel,
-                discovered_by_query=query,
-                title=snippet.get("title") or "Без названия",
-                description=snippet.get("description"),
-                url=f"https://www.youtube.com/watch?v={external_video_id}",
-                thumbnail_url=thumbnail_url,
-                published_at=published_at,
-                duration_seconds=duration_seconds,
-                view_count=view_count,
-                like_count=like_count,
-                comment_count=comment_count,
-            )
-            db.add(video)
-            created += 1
-        else:
-            video.view_count = view_count
-            video.like_count = like_count
-            video.comment_count = comment_count
-            video.thumbnail_url = thumbnail_url or video.thumbnail_url
-            video.duration_seconds = duration_seconds or video.duration_seconds
-            updated += 1
-
-        video.metric_snapshots.append(
-            VideoMetricSnapshot(
-                view_count=view_count,
-                like_count=like_count,
-                comment_count=comment_count,
-            )
+        outcome = store_video(
+            db, item, source_type="topic_search",
+            channels_raw=channels_raw, discovered_by_query=query,
         )
+        created += outcome == "created"
+        updated += outcome == "updated"
 
     db.commit()
     recompute_all_scores(db)
     return {"found": len(videos_raw), "created": created, "updated": updated, "skipped": skipped}
+
+
+def store_video(db: Session, item: dict, source_type: str, channels_raw: dict | None = None,
+                discovered_by_query: SearchQuery | None = None) -> str:
+    """Upserts one YouTube video item (+ its channel and a metric snapshot).
+    Shared by topic search, watchlist sync and manual import."""
+    snippet = item.get("snippet") or {}
+    statistics = item.get("statistics") or {}
+    content_details = item.get("contentDetails") or {}
+    external_video_id = item["id"]
+    external_channel_id = snippet["channelId"]
+
+    channel = _upsert_channel(
+        db, external_channel_id, snippet, (channels_raw or {}).get(external_channel_id, {})
+    )
+
+    view_count = _safe_int(statistics.get("viewCount")) or 0
+    like_count = _safe_int(statistics.get("likeCount")) or 0
+    comment_count = _safe_int(statistics.get("commentCount")) or 0
+    duration_seconds = parse_iso8601_duration(content_details.get("duration"))
+    thumbnail_url = _pick_thumbnail(snippet.get("thumbnails"))
+
+    video = db.scalar(select(Video).where(Video.external_video_id == external_video_id))
+    if video is None:
+        video = Video(
+            external_video_id=external_video_id,
+            channel=channel,
+            discovered_by_query=discovered_by_query,
+            source_type=source_type,
+            title=snippet.get("title") or "Без названия",
+            description=snippet.get("description"),
+            url=f"https://www.youtube.com/watch?v={external_video_id}",
+            thumbnail_url=thumbnail_url,
+            published_at=_parse_datetime(snippet.get("publishedAt")),
+            duration_seconds=duration_seconds,
+            view_count=view_count,
+            like_count=like_count,
+            comment_count=comment_count,
+        )
+        db.add(video)
+        outcome = "created"
+    else:
+        video.view_count = view_count
+        video.like_count = like_count
+        video.comment_count = comment_count
+        video.thumbnail_url = thumbnail_url or video.thumbnail_url
+        video.duration_seconds = duration_seconds or video.duration_seconds
+        outcome = "updated"
+
+    video.metric_snapshots.append(
+        VideoMetricSnapshot(view_count=view_count, like_count=like_count, comment_count=comment_count)
+    )
+    return outcome
 
 
 def _is_eligible(duration_seconds: int | None, snippet: dict, settings) -> bool:
@@ -161,6 +176,8 @@ def cleanup_ineligible_videos(db: Session) -> int:
     allowed = settings.allowed_language_set
     removed = 0
     for video in db.scalars(select(Video)).all():
+        if video.source_type == "manual_import":
+            continue  # manually added videos are a deliberate choice — never auto-remove
         too_short = (
             video.duration_seconds is not None
             and video.duration_seconds < settings.min_duration_seconds

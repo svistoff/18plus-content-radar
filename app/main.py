@@ -17,11 +17,18 @@ from app.database import Base, SessionLocal, engine, get_db
 from app.models import Channel, ContentPack, SearchQuery, Video
 from app.seed import seed_search_queries
 from app.services.ai_content_service import AIContentError, generate_content_pack
+from app.services.channel_service import (
+    ChannelImportError,
+    add_watchlist_channel,
+    list_watchlist,
+    sync_watchlist,
+)
 from app.services.discovery_service import (
     cleanup_ineligible_videos,
     run_all_enabled_queries,
     run_search_for_query,
 )
+from app.services.import_service import ImportError_, import_video_by_url
 from app.services.metrics_service import refresh_all_metrics
 from app.services.scheduler import build_scheduler
 from app.services.scoring_service import recompute_all_scores
@@ -44,6 +51,7 @@ _POSTGRES_COLUMN_PATCHES = (
     "ALTER TABLE videos ADD COLUMN IF NOT EXISTS comment_count INTEGER DEFAULT 0",
     "ALTER TABLE videos ADD COLUMN IF NOT EXISTS score_explanation TEXT",
     "ALTER TABLE videos ADD COLUMN IF NOT EXISTS scored_at TIMESTAMPTZ",
+    "ALTER TABLE videos ADD COLUMN IF NOT EXISTS source_type VARCHAR(20) DEFAULT 'topic_search'",
 )
 
 
@@ -295,3 +303,70 @@ def save_settings(
     brand.custom_instructions = custom_instructions.strip()
     db.commit()
     return RedirectResponse(f"/settings?ok={quote('Настройки сохранены')}", status_code=303)
+
+
+@app.get("/import", response_class=HTMLResponse)
+def import_page(request: Request):
+    return templates.TemplateResponse(
+        request,
+        "import.html",
+        {
+            "ok_message": request.query_params.get("ok"),
+            "error_message": request.query_params.get("error"),
+        },
+    )
+
+
+@app.post("/import")
+def import_video(url: str = Form(...), db: Session = Depends(get_db)):
+    try:
+        video = import_video_by_url(db, url)
+    except (ImportError_, YouTubeAPIError) as exc:
+        return RedirectResponse(f"/import?error={quote(str(exc))}", status_code=303)
+    return RedirectResponse(f"/videos?ok={quote('Ролик добавлен: ' + video.title)}", status_code=303)
+
+
+@app.get("/channels", response_class=HTMLResponse)
+def channels_page(request: Request, db: Session = Depends(get_db)):
+    channels = list_watchlist(db)
+    return templates.TemplateResponse(
+        request,
+        "channels.html",
+        {
+            "channels": channels,
+            "ok_message": request.query_params.get("ok"),
+            "error_message": request.query_params.get("error"),
+        },
+    )
+
+
+@app.post("/channels")
+def add_channel(url: str = Form(...), db: Session = Depends(get_db)):
+    try:
+        channel = add_watchlist_channel(db, url)
+    except (ChannelImportError, YouTubeAPIError) as exc:
+        return RedirectResponse(f"/channels?error={quote(str(exc))}", status_code=303)
+    return RedirectResponse(
+        f"/channels?ok={quote('Канал добавлен в watchlist: ' + channel.title)}", status_code=303
+    )
+
+
+@app.post("/channels/{channel_id}/remove")
+def remove_channel(channel_id: uuid.UUID, db: Session = Depends(get_db)):
+    from app.services.channel_service import remove_watchlist_channel
+
+    remove_watchlist_channel(db, channel_id)
+    return RedirectResponse("/channels", status_code=303)
+
+
+@app.post("/channels/sync")
+def sync_channels(db: Session = Depends(get_db)):
+    try:
+        totals = sync_watchlist(db)
+    except YouTubeAPIError as exc:
+        return RedirectResponse(f"/channels?error={quote(str(exc))}", status_code=303)
+    message = (
+        f"Синхронизировано каналов {totals['channels']}: новых {totals['created']}, "
+        f"обновлено {totals['updated']}, пропущено Shorts {totals['skipped']}"
+    )
+    return RedirectResponse(f"/channels?ok={quote(message)}", status_code=303)

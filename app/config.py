@@ -30,6 +30,7 @@ class Settings(BaseSettings):
     scheduler_enabled: bool = True
     search_interval_hours: int = 12
     metrics_interval_hours: int = 6
+    watchlist_interval_hours: int = 24
 
     # Отсекаем Shorts и слишком короткие клипы (в них мало материала для статьи).
     min_duration_seconds: int = 180

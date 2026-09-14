@@ -13,6 +13,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 
 from app.config import get_settings
 from app.database import SessionLocal
+from app.services.channel_service import sync_watchlist
 from app.services.discovery_service import run_all_enabled_queries
 from app.services.metrics_service import refresh_all_metrics
 
@@ -35,6 +36,15 @@ def _metrics_job() -> None:
         logger.info("scheduled metrics refresh: %s", totals)
     except Exception:
         logger.exception("scheduled metrics refresh failed")
+
+
+def _watchlist_job() -> None:
+    try:
+        with SessionLocal() as db:
+            totals = sync_watchlist(db)
+        logger.info("scheduled watchlist sync: %s", totals)
+    except Exception:
+        logger.exception("scheduled watchlist sync failed")
 
 
 def build_scheduler() -> BackgroundScheduler | None:
@@ -60,10 +70,19 @@ def build_scheduler() -> BackgroundScheduler | None:
         max_instances=1,
         coalesce=True,
     )
+    scheduler.add_job(
+        _watchlist_job,
+        "interval",
+        hours=max(1, settings.watchlist_interval_hours),
+        id="watchlist",
+        max_instances=1,
+        coalesce=True,
+    )
     scheduler.start()
     logger.info(
-        "scheduler started: discovery every %sh, metrics every %sh",
+        "scheduler started: discovery every %sh, metrics every %sh, watchlist every %sh",
         settings.search_interval_hours,
         settings.metrics_interval_hours,
+        settings.watchlist_interval_hours,
     )
     return scheduler
