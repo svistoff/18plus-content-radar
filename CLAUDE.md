@@ -13,19 +13,27 @@
 
 ## Деплой
 
-В отличие от Supervisor-ботов на этом же VPS, `18plus-content-radar`
-разворачивается через **Docker Compose** (см. `docker-compose.yml`) — так
-рекомендовано в исходном ТЗ из-за зависимости от PostgreSQL (и позже
-Redis/Celery для планировщика). Не смешивать со Supervisor-конфигами других
-проектов.
+**Основной сервер (с 28.09.2026): `45.146.90.128`.** Проект живёт в
+`/root/18plus-content-radar`, деплой — `git pull` + пересборка контейнера.
+Дашборд открывается по `http://45.146.90.128:<WEB_PORT>` (порт из `.env`,
+по умолчанию 8095; проверить свободный через `ss -tlnp`).
+(Прежний сервер `77.110.125.73` больше не основной.)
 
-Основные команды:
+`18plus-content-radar` разворачивается через **Docker Compose** (см.
+`docker-compose.yml`) из-за зависимости от PostgreSQL — не смешивать со
+Supervisor-конфигами других проектов.
+
+Основные команды (после изменения кода/`.env`):
 
 ```bash
-docker compose up -d --build
-docker compose exec web alembic upgrade head   # появится вместе с Alembic
+cd /root/18plus-content-radar
+git pull
+docker compose up -d --build --force-recreate web
 docker compose logs -f web
 ```
+
+`--force-recreate` обязателен, чтобы контейнер перечитал `.env`
+(`docker compose restart` этого НЕ делает).
 
 `.env` не коммитится, в репозитории хранится только `.env.example`.
 

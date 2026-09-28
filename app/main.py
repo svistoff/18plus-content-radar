@@ -196,12 +196,15 @@ def recompute_scores(db: Session = Depends(get_db)):
 
 
 @app.get("/videos", response_class=HTMLResponse)
-def videos_page(request: Request, db: Session = Depends(get_db)):
-    videos = db.scalars(
+def videos_page(request: Request, source: str = "", db: Session = Depends(get_db)):
+    query = (
         select(Video)
         .options(joinedload(Video.channel), joinedload(Video.content_packs))
         .order_by(Video.viral_score.desc(), Video.published_at.desc().nullslast())
-    ).unique().all()
+    )
+    if source in ("topic_search", "watchlist_sync", "manual_import"):
+        query = query.where(Video.source_type == source)
+    videos = db.scalars(query).unique().all()
     items = [
         {
             "video": video,
@@ -215,6 +218,7 @@ def videos_page(request: Request, db: Session = Depends(get_db)):
         "videos.html",
         {
             "items": items,
+            "source": source,
             "ok_message": request.query_params.get("ok"),
             "error_message": request.query_params.get("error"),
         },
