@@ -18,7 +18,9 @@ from app.models import ContentPack, Transcript, Video
 from app.services.settings_service import get_brand_settings
 
 MAX_TRANSCRIPT_CHARS = 14000
-MAX_OUTPUT_TOKENS = 6000
+# Generous headroom: reasoning models spend completion tokens on internal
+# reasoning before the visible JSON, so a low cap truncates the output.
+MAX_OUTPUT_TOKENS = 16000
 
 SYSTEM_PROMPT = (
     "Ты — сильный контент-редактор блога о взрослых отношениях, знакомствах, "
@@ -92,7 +94,10 @@ def generate_content_pack(db: Session, video: Video, transcript: Transcript) -> 
 
     try:
         raw = _chat_completion(SYSTEM_PROMPT, user_prompt)
-        data = _parse_json(raw)
+        try:
+            data = _parse_json(raw)
+        except AIContentError:
+            data = _parse_json(_repair_json(raw))
     except AIContentError:
         video.workflow_status = "transcript_ready"
         db.commit()
@@ -225,9 +230,39 @@ def _adapt_params(params: dict, exc: Exception) -> bool:
 
 
 def _parse_json(raw: str) -> dict:
+    text = (raw or "").strip()
+
+    # Strip a ```json ... ``` / ``` ... ``` fence if the model wrapped the output.
+    if text.startswith("```"):
+        text = text[3:]
+        if text[:4].lower() == "json":
+            text = text[4:]
+        if text.endswith("```"):
+            text = text[:-3]
+        text = text.strip()
+
     try:
-        return json.loads(raw)
-    except json.JSONDecodeError as exc:
-        raise AIContentError(
-            "Модель вернула невалидный JSON. Попробуйте перегенерировать."
-        ) from exc
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    # Fall back to the outermost {...} block (handles leading/trailing prose).
+    start, end = text.find("{"), text.rfind("}")
+    if start != -1 and end > start:
+        try:
+            return json.loads(text[start : end + 1])
+        except json.JSONDecodeError:
+            pass
+
+    raise AIContentError("Модель вернула невалидный JSON. Попробуйте перегенерировать.")
+
+
+def _repair_json(raw: str) -> str:
+    """Ask the model to return the same content as strictly valid JSON."""
+    prompt = (
+        "Ниже — ответ, который должен был быть одним валидным JSON-объектом, но "
+        "оказался невалидным (обёртки, лишний текст или обрыв). Верни ТОЛЬКО "
+        "исправленный валидный JSON-объект по той же схеме, без markdown и "
+        "пояснений:\n\n" + (raw or "")[:12000]
+    )
+    return _chat_completion("Ты возвращаешь строго один валидный JSON-объект.", prompt)
